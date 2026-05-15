@@ -6,7 +6,7 @@ import os
 torch.backends.mkldnn.enabled = False
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForImageTextRetrieval
+from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForImageTextRetrieval, BlipForConditionalGeneration
 import torch.nn.functional as F
 from ultralytics import YOLO
 import faiss
@@ -65,6 +65,14 @@ def load_blip_itm_model():
     model.eval()
     return processor, model
 
+@st.cache_resource
+def load_blip_caption_model():
+    """BLIP image captioner — used to generate a text description of the query crop."""
+    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    model.eval()
+    return processor, model
+
 @st.cache_data
 def load_metadata():
     try:
@@ -87,6 +95,7 @@ with st.spinner("Loading models... This may take a minute on the first run."):
     yolo_model = load_yolo_model()
     clip_processor, clip_model = load_clip_model()
     blip_itm_processor, blip_itm_model = load_blip_itm_model()
+    blip_cap_processor, blip_cap_model = load_blip_caption_model()
     faiss_index = load_faiss_index()
     item_map, gallery_captions = load_metadata()
 
@@ -166,24 +175,47 @@ if uploaded_file is not None:
     # 4. Feature Extraction & FAISS Search
     k_input = st.slider("Number of top results to retrieve (k)", min_value=1, max_value=50, value=12)
 
-    btn_col1, btn_col2 = st.columns(2)
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
     run_standard = btn_col1.button("🔍 Find Similar Items", type="secondary", use_container_width=True)
     run_fast     = btn_col2.button("⚡ Fast Search", type="primary", use_container_width=True)
+    run_deep     = btn_col3.button("🧠 Deep Search", type="primary", use_container_width=True)
 
-    if run_standard or run_fast:
+    if run_standard or run_fast or run_deep:
         if item_map.empty:
             st.error("Cannot perform search: item_index_map.csv is missing.")
         else:
             st.subheader("3. Search Results")
             with st.spinner("Extracting features and searching gallery..."):
-                # Process crop through CLIP
-                inputs = clip_processor(images=selected_crop, return_tensors="pt")
+                # ── CLIP image embedding (shared by all three modes) ──────────
+                img_inputs = clip_processor(images=selected_crop, return_tensors="pt")
                 with torch.no_grad():
-                    raw = clip_model.get_image_features(**inputs)
-                    raw_features = raw.pooler_output if hasattr(raw, 'pooler_output') and not isinstance(raw, torch.Tensor) else raw
+                    raw = clip_model.get_image_features(**img_inputs)
+                    image_features = raw.pooler_output if hasattr(raw, 'pooler_output') and not isinstance(raw, torch.Tensor) else raw
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-                    query_vec = raw_features / raw_features.norm(dim=-1, keepdim=True)
-                    query_vec = query_vec.numpy()
+                if run_deep:
+                    # ── Deep Search: fuse image + caption embeddings ──────────
+                    # Step 1: Generate a caption for the query crop via BLIP
+                    cap_inputs = blip_cap_processor(images=selected_crop, return_tensors="pt")
+                    with torch.no_grad():
+                        cap_ids = blip_cap_model.generate(**cap_inputs, max_new_tokens=50)
+                    query_caption = blip_cap_processor.decode(cap_ids[0], skip_special_tokens=True)
+                    st.info(f"🖊️ Generated caption: *{query_caption}*")
+
+                    # Step 2: CLIP text embedding of the generated caption
+                    txt_inputs = clip_processor(text=[query_caption], return_tensors="pt", padding=True, truncation=True)
+                    with torch.no_grad():
+                        text_features = clip_model.get_text_features(**txt_inputs)
+                        text_features = text_features.pooler_output if hasattr(text_features, 'pooler_output') and not isinstance(text_features, torch.Tensor) else text_features
+                        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                    # Step 3: Fuse — v = α·φ_V + (1−α)·φ_T, then normalize
+                    alpha = 0.7
+                    fused = alpha * image_features + (1 - alpha) * text_features
+                    fused = fused / fused.norm(dim=-1, keepdim=True)
+                    query_vec = fused.numpy()
+                else:
+                    query_vec = image_features.numpy()
 
                 # Search FAISS
                 k = k_input
@@ -205,7 +237,7 @@ if uploaded_file is not None:
                         continue
 
             # ── Re-ranking: choose method based on which button was clicked ──
-            if run_standard:
+            if run_standard and not run_deep:
                 # Original method: one full BLIP forward pass per candidate
                 with st.spinner("Re-ranking candidates using BLIP ITM (standard)..."):
                     for cand in candidates:
