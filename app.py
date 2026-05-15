@@ -163,8 +163,8 @@ if uploaded_file is not None:
         st.image(selected_crop, width=200, caption=f"Selected: {crop_labels[selected_crop_idx]}")
         
     st.divider()
-        
-        # 4. Feature Extraction & FAISS Search
+    # 4. Feature Extraction & FAISS Search
+    k_input = st.slider("Number of top results to retrieve (k)", min_value=1, max_value=50, value=12)
     if st.button("🔍 Find Similar Items", type="primary", use_container_width=True):
         if item_map.empty:
             st.error("Cannot perform search: item_index_map.csv is missing.")
@@ -181,7 +181,7 @@ if uploaded_file is not None:
                     query_vec = query_vec.numpy()
                     
                 # Search FAISS
-                k = 12 # Top 12 results
+                k = k_input
                 distances, indices = faiss_index.search(query_vec, k)
                 
                 # Step 4: Candidate Re-ranking
