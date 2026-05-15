@@ -165,7 +165,12 @@ if uploaded_file is not None:
     st.divider()
     # 4. Feature Extraction & FAISS Search
     k_input = st.slider("Number of top results to retrieve (k)", min_value=1, max_value=50, value=12)
-    if st.button("🔍 Find Similar Items", type="primary", use_container_width=True):
+
+    btn_col1, btn_col2 = st.columns(2)
+    run_standard = btn_col1.button("🔍 Find Similar Items", type="secondary", use_container_width=True)
+    run_fast     = btn_col2.button("⚡ Fast Search", type="primary", use_container_width=True)
+
+    if run_standard or run_fast:
         if item_map.empty:
             st.error("Cannot perform search: item_index_map.csv is missing.")
         else:
@@ -176,15 +181,15 @@ if uploaded_file is not None:
                 with torch.no_grad():
                     raw = clip_model.get_image_features(**inputs)
                     raw_features = raw.pooler_output if hasattr(raw, 'pooler_output') and not isinstance(raw, torch.Tensor) else raw
-                    
+
                     query_vec = raw_features / raw_features.norm(dim=-1, keepdim=True)
                     query_vec = query_vec.numpy()
-                    
+
                 # Search FAISS
                 k = k_input
                 distances, indices = faiss_index.search(query_vec, k)
-                
-                # Step 4: Candidate Re-ranking
+
+                # Build candidate list
                 candidates = []
                 for dist, idx in zip(distances[0], indices[0]):
                     try:
@@ -198,59 +203,109 @@ if uploaded_file is not None:
                         })
                     except IndexError:
                         continue
-                        
-                # Perform Semantic re-ranking (BLIP ITM)
-                with st.spinner("Re-ranking candidates using BLIP ITM..."):
+
+            # ── Re-ranking: choose method based on which button was clicked ──
+            if run_standard:
+                # Original method: one full BLIP forward pass per candidate
+                with st.spinner("Re-ranking candidates using BLIP ITM (standard)..."):
                     for cand in candidates:
                         if cand['caption'] == "No caption available.":
                             cand['itm_score'] = 0.0
                             continue
-                            
-                        # Compute ITM score with query image and candidate caption
-                        inputs = blip_itm_processor(images=selected_crop, text=cand['caption'], return_tensors="pt")
+
+                        blip_inputs = blip_itm_processor(
+                            images=selected_crop, text=cand['caption'], return_tensors="pt"
+                        )
                         with torch.no_grad():
-                            itm_output = blip_itm_model(**inputs)
-                            # Softmax the score, index 1 is the positive match probability
+                            itm_output = blip_itm_model(**blip_inputs)
                             itm_score = F.softmax(itm_output.itm_score, dim=1)[0][1].item()
                         cand['itm_score'] = itm_score
-                        
-                    # Sort by ITM score in descending order
-                    candidates.sort(key=lambda x: x['itm_score'], reverse=True)
-                
-                # Display Results in Grid
-                cols = st.columns(4)
-                
-                for i, cand in enumerate(candidates):
-                    col = cols[i % 4]
-                    
-                    dist = cand['dist']
-                    item_id = cand['item_id']
-                    image_name = cand['image_name']
-                    caption = cand['caption']
-                    itm_score = cand['itm_score']
-                    
-                    # Determine the correct local path for the image crop
-                    if image_name.startswith('img/'):
-                        relative_path = image_name[4:] # strip "img/"
-                    else:
-                        relative_path = image_name
-                        
-                    crop_path = os.path.join("yolo_crops", "data", "bbox_crops", relative_path)
-                    
-                    if not os.path.exists(crop_path):
-                        crop_path = None
-                    
-                    with col:
-                        with st.container(border=True):
-                            if crop_path and os.path.exists(crop_path):
-                                img = Image.open(crop_path)
-                                # Pad the image to a uniform 300x400 size with white background
-                                img = ImageOps.pad(img, (300, 400), color="white")
-                                st.image(img, use_container_width=True)
-                            else:
-                                st.warning("Image missing")
-                                
-                            st.markdown(f"**Similarity (CLIP):** {dist:.4f}")
-                            st.markdown(f"**ITM Score (BLIP):** {itm_score:.4f}")
-                            st.markdown(f"**Item ID:** {item_id}")
-                            st.markdown(f"<div class='result-caption'>{caption}</div>", unsafe_allow_html=True)
+
+            else:
+                # Fast method: encode image once, single batched pass for all captions
+                with st.spinner("Re-ranking candidates using BLIP ITM (fast)..."):
+                    # Step 1: Encode the query image ONCE
+                    pixel_values = blip_itm_processor(
+                        images=selected_crop, return_tensors="pt"
+                    ).pixel_values
+                    with torch.no_grad():
+                        vision_outputs = blip_itm_model.vision_model(pixel_values)
+                        image_embeds = vision_outputs.last_hidden_state   # (1, seq_len, hidden)
+                        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long)
+
+                    # Step 2: Assign 0 to no-caption candidates
+                    scored_cands = [c for c in candidates if c['caption'] != "No caption available."]
+                    for c in candidates:
+                        if c['caption'] == "No caption available.":
+                            c['itm_score'] = 0.0
+
+                    # Step 3: Single batched forward pass for all captions
+                    if scored_cands:
+                        captions = [c['caption'] for c in scored_cands]
+                        text_inputs = blip_itm_processor(
+                            text=captions,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                        )
+                        batch_size = len(captions)
+
+                        with torch.no_grad():
+                            expanded_image_embeds = image_embeds.expand(batch_size, -1, -1)
+                            expanded_image_atts   = image_atts.expand(batch_size, -1)
+
+                            text_outputs = blip_itm_model.text_encoder(
+                                input_ids=text_inputs.input_ids,
+                                attention_mask=text_inputs.attention_mask,
+                                encoder_hidden_states=expanded_image_embeds,
+                                encoder_attention_mask=expanded_image_atts,
+                                return_dict=True,
+                            )
+
+                            itm_logits = blip_itm_model.itm_head(
+                                text_outputs.last_hidden_state[:, 0, :]
+                            )
+                            itm_probs = F.softmax(itm_logits, dim=1)[:, 1].tolist()
+
+                        for cand, score in zip(scored_cands, itm_probs):
+                            cand['itm_score'] = score
+
+            # Sort by ITM score (both paths)
+            candidates.sort(key=lambda x: x['itm_score'], reverse=True)
+
+            # ── Display Results in Grid ───────────────────────────────────────
+            cols = st.columns(4)
+
+            for i, cand in enumerate(candidates):
+                col = cols[i % 4]
+
+                dist       = cand['dist']
+                item_id    = cand['item_id']
+                image_name = cand['image_name']
+                caption    = cand['caption']
+                itm_score  = cand['itm_score']
+
+                # Determine the correct local path for the image crop
+                if image_name.startswith('img/'):
+                    relative_path = image_name[4:]   # strip "img/"
+                else:
+                    relative_path = image_name
+
+                crop_path = os.path.join("yolo_crops", "data", "bbox_crops", relative_path)
+
+                if not os.path.exists(crop_path):
+                    crop_path = None
+
+                with col:
+                    with st.container(border=True):
+                        if crop_path and os.path.exists(crop_path):
+                            img = Image.open(crop_path)
+                            img = ImageOps.pad(img, (300, 400), color="white")
+                            st.image(img, use_container_width=True)
+                        else:
+                            st.warning("Image missing")
+
+                        st.markdown(f"**Similarity (CLIP):** {dist:.4f}")
+                        st.markdown(f"**ITM Score (BLIP):** {itm_score:.4f}")
+                        st.markdown(f"**Item ID:** {item_id}")
+                        st.markdown(f"<div class='result-caption'>{caption}</div>", unsafe_allow_html=True)
