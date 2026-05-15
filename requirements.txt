@@ -1,0 +1,12 @@
+streamlit
+torch
+torchvision
+transformers
+faiss-cpu
+pandas
+numpy
+scipy
+scikit-learn
+Pillow
+ultralytics
+streamlit-cropper
